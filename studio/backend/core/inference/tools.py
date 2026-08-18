@@ -10881,7 +10881,7 @@ def _web_search(
         text += (
             "\n\n---\n\nIMPORTANT: These are only short snippets. "
             "To get the full page content, call web_search with "
-            'the url parameter (e.g. {"url": "<URL>"}).'
+            'the url parameter.'
         )
         return text
     except Exception as e:
