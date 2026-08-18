@@ -10473,6 +10473,8 @@ def _fetch_url_raw(
     if not ok:
         return reason, "", ""
 
+    from urllib.parse import urlparse, urljoin, urlunparse
+
     # --------------------------------------------------------------
     # 3️⃣ Prepare a curl session
     # --------------------------------------------------------------
