@@ -10401,167 +10401,217 @@ def _normalize_url_scheme(url: str) -> str:
         return url
     return "https://" + rest
 
+from typing import Tuple, Dict, Optional
+from curl_cffi import requests
+
+class _CurlStreamAdapter:
+    """
+    Minimal wrapper so that the existing `_read_capped_body` code can treat
+    the streamed response exactly like a file‑like object exposing ``read(size)``.
+    """
+    def __init__(self, resp):
+        self._resp = resp                # the original Response
+        self._iterator = resp.iter_content(chunk_size=8192)
+        self._buffer = b""               # leftover bytes from a previous read
+
+    def read(self, size: int = -1) -> bytes:
+        """
+        Return up to *size* bytes (or the whole remaining stream if size < 0).
+        The implementation pulls chunks from ``iter_content`` until the
+        requested amount is satisfied.
+        """
+        if size == -1:
+            # Read everything: join remaining iterator + buffer.
+            chunks = [self._buffer] + list(self._iterator)
+            self._buffer = b""
+            return b"".join(chunks)
+
+        # Fill the buffer until we have at least *size* bytes or the stream ends.
+        while len(self._buffer) < size:
+            try:
+                chunk = next(self._iterator)
+                self._buffer += chunk
+            except StopIteration:
+                # No more data – break and return what we have.
+                break
+
+        # Slice the buffer.
+        out, self._buffer = self._buffer[:size], self._buffer[size:]
+        return out
 
 def _fetch_url_raw(
     url: str,
     timeout: int = 30,
-    extra_headers: dict | None = None,
-    deadline: float | None = None,
+    extra_headers: Optional[Dict[str, str]] = None,
+    deadline: Optional[float] = None,
     cancel_event = None,
-    website_policy: dict | None = None,
-) -> tuple[str | None, str, str]:
-    """Fetch a URL with SSRF protection; return ``(error, body_text, content_type)``.
-
-    ``error`` is a user-facing message string when the fetch failed (the
-    existing "Blocked:" / "Failed to fetch URL:" wording), else ``None``.
-    Blocks private/loopback/link-local targets and caps the download size.
-    No input reaches the caller as an exception: the URL is model-supplied, so
-    every malformed form resolves to one of these strings.
-
-    ``deadline`` is an optional ``time.monotonic`` cutoff for the whole fetch
-    (redirect hops and body read included) and ``cancel_event`` aborts it when
-    the caller goes away; both default off so callers keep the old behavior.
+    website_policy: Optional[Dict] = None,
+) -> Tuple[Optional[str], str, str]:
     """
-    from urllib.parse import urlparse
-    from .web_access_policy import check_url_access
+    Fetch a URL with SSRF protection using curl_cffi.
+    Returns (error, body_text, content_type) where *error* is a user‑facing
+    message (e.g. “Blocked: …”) or None on success.
+    """
 
-    # Before the policy gate: it requires an http(s) scheme, so a bare host
-    # would be refused there and never reach the fetch.
+    # --------------------------------------------------------------
+    # 1️⃣ Normalise scheme & run policy gate
+    # --------------------------------------------------------------
+    from .web_access_policy import check_url_access
     url = _normalize_url_scheme(url)
     allowed, reason, canonical_host = check_url_access(url, website_policy)
     if not allowed:
         return reason, "", ""
 
-    # check_url_access already parsed this and read .port, so this cannot raise.
+    # --------------------------------------------------------------
+    # 2️⃣ Resolve host (respect budget & possible cancel)
+    # --------------------------------------------------------------
     parsed = urlparse(url)
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     ok, reason, pinned_ip = _resolve_with_budget(
-        canonical_host,
-        port,
-        deadline,
-        cancel_event,
+        canonical_host, port, deadline, cancel_event
     )
     if not ok:
         return reason, "", ""
 
-    try:
-        from urllib.error import HTTPError as _HTTPError
-        from urllib.parse import urljoin, urlunparse
+    # --------------------------------------------------------------
+    # 3️⃣ Prepare a curl session
+    # --------------------------------------------------------------
+    session = requests.Session()
+    ua = random.choice(_USER_AGENTS)
+    default_headers = {"User-Agent": ua, "Host": canonical_host}
+    if extra_headers:
+        default_headers.update(extra_headers)
 
-        max_bytes = _MAX_FETCH_BYTES
-        current_url = url
-        current_host = canonical_host
-        ua = random.choice(_USER_AGENTS)
+    # libcurl will follow redirects for us, but we need to enforce the same
+    # limits (max 5 hops, policy check on each target, and DNS‑pinning).
+    max_redirects = 5
+    redirect_count = 0
+    current_url = url
+    current_host = canonical_host
 
-        for _hop in range(5):
-            budget_error = _fetch_budget_exceeded(deadline, cancel_event)
-            if budget_error is not None:
-                return budget_error, "", ""
-            cp = urlparse(current_url)
-            # Bracket IPv6 so the netloc stays a valid URL.
-            validated_netloc = f"[{current_host}]" if ":" in current_host else current_host
-            if cp.port:
-                validated_netloc = f"{validated_netloc}:{cp.port}"
-            # Decide routing once, on the netloc urllib tests: a pinned request
-            # carries an IP, which no NO_PROXY entry matches, so the opener below
-            # has to carry the decision rather than re-derive it.
-            proxied = _explicit_proxy_applies(cp.scheme, validated_netloc)
-            if os.environ.get(_DISABLE_DNS_PINNING_ENV) == "1" and proxied:
-                # Enterprise proxies need the hostname in CONNECT for policy and TLS
-                # interception, and they resolve it, so nothing rebinds behind us.
-                request_url = urlunparse(cp._replace(netloc = validated_netloc))
-            else:
-                # Pin to the validated IP to prevent DNS rebinding.
-                ip_str = f"[{pinned_ip}]" if ":" in pinned_ip else pinned_ip
-                ip_netloc = f"{ip_str}:{cp.port}" if cp.port else ip_str
-                request_url = urlunparse(cp._replace(netloc = ip_netloc))
+    while True:
+        # ------------------------------------------------------------------
+        #   a) Enforce overall deadline / per‑hop timeout
+        # ------------------------------------------------------------------
+        now = time.monotonic()
+        remaining = None if deadline is None else max(0.0, deadline - now)
+        hop_timeout = _fetch_hop_timeout(timeout, deadline)
 
-            handlers = [_NoRedirect, _SNIHTTPSHandler(current_host)]
-            if not proxied:
-                # An empty ProxyHandler is the documented way to opt a request out.
-                handlers.append(urllib.request.ProxyHandler({}))
-            opener = urllib.request.build_opener(*handlers)
+        # ------------------------------------------------------------------
+        #   b) Build request URL – either pinned IP or normal host
+        # ------------------------------------------------------------------
+        if os.environ.get(_DISABLE_DNS_PINNING_ENV) == "1":
+            request_url = current_url
+        else:
+            # Replace the netloc with the pinned IP while keeping the original
+            # host name for SNI/TLS verification.
+            ip_str = f"[{pinned_ip}]" if ":" in pinned_ip else pinned_ip
+            netloc = f"{ip_str}:{parsed.port}" if parsed.port else ip_str
+            # Preserve path, query, fragment etc.
+            request_url = urlunparse(
+                urlparse(current_url)._replace(netloc=netloc)
+            )
 
-            headers = {
-                "User-Agent": ua,
-                "Host": validated_netloc,
-            }
-            if extra_headers:
-                headers.update(extra_headers)
-            req = urllib.request.Request(request_url, headers = headers)
-            try:
-                # Cap the socket timeout at the time left on the overall deadline
-                # so a single slow hop cannot outlast the whole fetch budget.
-                resp = opener.open(req, timeout = _fetch_hop_timeout(timeout, deadline))
-            except _HTTPError as e:
-                if e.code not in (301, 302, 303, 307, 308):
-                    return f"Failed to fetch URL: HTTP {e.code} {getattr(e, 'reason', '')}", "", ""
-                location = e.headers.get("Location")
-                if not location:
-                    return "Failed to fetch URL: redirect missing Location header.", "", ""
-                current_url = urljoin(current_url, location)
-                # Server-controlled, so never scheme-upgraded; the gate below
-                # reads .port first, so the parse after it cannot raise.
-                allowed, policy_reason, redirect_host = check_url_access(
-                    current_url,
-                    website_policy,
-                )
-                if not allowed:
-                    return policy_reason, "", ""
-                rp = urlparse(current_url)
-                rp_port = rp.port or (443 if rp.scheme == "https" else 80)
-                ok2, reason2, pinned_ip = _resolve_with_budget(
-                    redirect_host,
-                    rp_port,
-                    deadline,
-                    cancel_event,
-                )
-                if not ok2:
-                    return reason2, "", ""
-                current_host = redirect_host
-                continue
+        # ------------------------------------------------------------------
+        #   c) Issue the request
+        # ------------------------------------------------------------------
+        try:
+            resp = session.get(
+                request_url,
+                headers=default_headers,
+                timeout=hop_timeout,
+                allow_redirects=False,   # we handle redirects manually
+                verify=False,             # default TLS verification
+                stream=True,             # we will read in chunks ourselves
+                impersonate="firefox"
+            )
+        except requests.exceptions.RequestException as exc:
+            # Normalise error messages to the format the caller expects.
+            return f"Failed to fetch URL: {exc}", "", ""
 
-            # get_content_type() defaults to "text/plain" when the header is
-            # absent (RFC 2045); report "" instead so callers can tell a missing
-            # header apart from a server that really declared text/plain.
-            if resp.headers.get("Content-Type") is None:
-                content_type = ""
-            else:
-                content_type = (resp.headers.get_content_type() or "").lower()
+        # ------------------------------------------------------------------
+        #   d) Handle redirects (manual, to run policy on each hop)
+        # ------------------------------------------------------------------
+        if resp.status_code in (301, 302, 303, 307, 308):
+            redirect_location = resp.headers.get("Location")
+            if not redirect_location:
+                return "Failed to fetch URL: redirect missing Location header.", "", ""
 
-            # Success: read the capped body enforcing the budget between chunks
-            # (see _read_capped_body), so a slow-drip server can't stretch a
-            # single resp.read past the deadline.
-            declared_pdf = content_type == "application/pdf"
-            read_limit = _MAX_PDF_FETCH_BYTES + 1 if declared_pdf else max_bytes
-            body_error, raw_bytes = _read_capped_body(
-                resp,
-                read_limit,
+            if redirect_count >= max_redirects:
+                return "Failed to fetch URL: too many redirects.", "", ""
+
+            # Resolve the next URL (relative → absolute)
+            current_url = urljoin(current_url, redirect_location)
+
+            # Run policy check on the new target before following it.
+            allowed, policy_reason, redirect_host = check_url_access(
+                current_url, website_policy
+            )
+            if not allowed:
+                return policy_reason, "", ""
+
+            # Resolve the new host (with budget checks)
+            rp = urlparse(current_url)
+            rp_port = rp.port or (443 if rp.scheme == "https" else 80)
+            ok2, reason2, pinned_ip = _resolve_with_budget(
+                redirect_host, rp_port, deadline, cancel_event
+            )
+            if not ok2:
+                return reason2, "", ""
+
+            current_host = redirect_host
+            redirect_count += 1
+            continue  # go round the loop with the new URL
+
+        # ------------------------------------------------------------------
+        #   e) Non‑redirect response – read body respecting size limits
+        # ------------------------------------------------------------------
+        content_type = resp.headers.get("Content-Type", "")
+        # Normalise to just the MIME type (ignore charset etc.)
+        if content_type:
+            content_type = content_type.split(";", 1)[0].strip().lower()
+        else:
+            content_type = ""
+
+        # Decide read limit – PDFs get a higher ceiling.
+        declared_pdf = content_type == "application/pdf"
+        read_limit = (
+            _MAX_PDF_FETCH_BYTES + 1 if declared_pdf else _MAX_FETCH_BYTES
+        )
+
+        stream = _CurlStreamAdapter(resp)
+
+        # Stream read in chunks while enforcing the byte budget and possible cancel.
+        body_error, raw_bytes = _read_capped_body(
+               stream, read_limit, timeout, deadline, cancel_event
+#            resp.raw, read_limit, timeout, deadline, cancel_event
+        )
+        if body_error is not None:
+            return body_error, "", ""
+
+        # Detect PDF magic if we stopped exactly at the generic limit.
+        if not declared_pdf and len(raw_bytes) == _MAX_FETCH_BYTES and _has_pdf_magic(
+            raw_bytes
+        ):
+            # Pull the remaining PDF tail (same logic as the original code).
+            tail_error, tail = _read_capped_body(
+#                resp.raw,
+                stream,
+                _MAX_PDF_FETCH_BYTES - _MAX_FETCH_BYTES + 1,
                 timeout,
                 deadline,
                 cancel_event,
             )
-            if body_error is not None:
-                return body_error, "", ""
+            if tail_error is not None:
+                return tail_error, "", ""
+            raw_bytes += tail
 
-            # A missing or wrong PDF MIME type is common: once the initial text-sized
-            # read identifies PDF magic, finish the bounded download to reach the EOF xref.
-            if not declared_pdf and len(raw_bytes) == max_bytes and _has_pdf_magic(raw_bytes):
-                tail_error, tail = _read_capped_body(
-                    resp,
-                    _MAX_PDF_FETCH_BYTES - max_bytes + 1,
-                    timeout,
-                    deadline,
-                    cancel_event,
-                )
-                if tail_error is not None:
-                    return tail_error, "", ""
-                raw_bytes += tail
-            break
-        else:
-            return "Failed to fetch URL: too many redirects.", "", ""
-
+        # --------------------------------------------------------------
+        # 4️⃣ Post‑processing – PDF extraction, binary guards, charset handling
+        # --------------------------------------------------------------
         is_pdf = declared_pdf or _has_pdf_magic(raw_bytes)
+
+        # ---- PDF path -------------------------------------------------
         if is_pdf:
             if len(raw_bytes) > _MAX_PDF_FETCH_BYTES:
                 return (
@@ -10569,27 +10619,27 @@ def _fetch_url_raw(
                     "",
                     content_type,
                 )
+            # Check budget one last time before heavy work.
             budget_error = _fetch_budget_exceeded(deadline, cancel_event)
             if budget_error is not None:
                 return budget_error, "", content_type
+
             try:
                 pdf_text = _extract_pdf_text(raw_bytes)
             except Exception as exc:
-                logger.debug("web PDF text extraction failed (%s)", type(exc).__name__)
                 return "(PDF content could not be read as text)", "", content_type
+
             budget_error = _fetch_budget_exceeded(deadline, cancel_event)
             if budget_error is not None:
                 return budget_error, "", content_type
+
             if not pdf_text:
                 pdf_text = "(PDF contains no extractable text)"
-            # Report the true type even for a mislabeled body so the caller's "html"
-            # check routes the extracted text to the plain-text path, not html_to_markdown.
             return None, pdf_text, "application/pdf"
 
-        # Reject known-binary MIME types before decoding. Binary is returned as the
-        # error string so the caller surfaces the placeholder, not replacement chars.
+        # ---- Binary‑content guards ------------------------------------
         if not _is_text_candidate_content_type(content_type):
-            # Only echo a clean MIME token back to the model.
+            # Strip parameters, keep only MIME token.
             m = re.match(r"[\w.+-]+/[\w.+-]+", content_type or "")
             safe_type = m.group(0) if m else "unknown type"
             return (
@@ -10598,7 +10648,6 @@ def _fetch_url_raw(
                 content_type,
             )
 
-        # Catch text-labeled binary via its magic signature.
         if _has_binary_magic(raw_bytes):
             return (
                 f"(binary content, {len(raw_bytes)} bytes; not readable as text)",
@@ -10606,25 +10655,29 @@ def _fetch_url_raw(
                 content_type,
             )
 
-        declared = resp.headers.get_content_charset()
+        # ---- Charset detection & Unicode BOM handling -----------------
+        declared = resp.encoding  # curl_cffi mirrors requests; may be None
         declared_codec = codecs.lookup(declared).name if declared else None
         bom_codec = next(
-            (codec for bom, codec in _UNICODE_BOM_CODECS if raw_bytes.startswith(bom)),
+            (
+                codec
+                for bom, codec in _UNICODE_BOM_CODECS
+                if raw_bytes.startswith(bom)
+            ),
             None,
         )
-        raw_html = raw_bytes.decode(declared or bom_codec or "utf-8", errors = "replace")
+        raw_text = raw_bytes.decode(
+            declared or bom_codec or "utf-8", errors="replace"
+        )
 
-        # Catch mislabeled or unlabeled binary, including valid UTF-8 controls.
-        if _looks_binary(raw_html):
-            # Rescue undeclared cp1252 only when the bytes have text structure.
-            alt = (
-                raw_bytes.decode("cp1252", "replace")
-                if declared_codec in (None, "iso8859-1")
-                and _has_single_byte_text_evidence(raw_bytes)
-                else None
-            )
+        # ---- Final binary sanity check --------------------------------
+        if _looks_binary(raw_text):
+            alt = None
+            if declared_codec in (None, "iso8859-1"):
+                if _has_single_byte_text_evidence(raw_bytes):
+                    alt = raw_bytes.decode("cp1252", "replace")
             if alt is not None and not _looks_binary(alt):
-                raw_html = alt
+                raw_text = alt
             else:
                 return (
                     f"(binary content, {len(raw_bytes)} bytes; not readable as text)",
@@ -10632,12 +10685,13 @@ def _fetch_url_raw(
                     content_type,
                 )
 
-        return None, raw_html, content_type
-    except _HTTPError as e:
-        return f"Failed to fetch URL: HTTP {e.code} {getattr(e, 'reason', '')}", "", ""
-    except Exception as e:
-        return f"Failed to fetch URL: {e}", "", ""
+        # --------------------------------------------------------------
+        # 5️⃣ Success – return decoded body and MIME type
+        # --------------------------------------------------------------
+        return None, raw_text, content_type
 
+    # Should never reach here
+    return "Failed to fetch URL: unknown error", "", ""
 
 # Tags that, at the very START of a body, mark it as HTML. Excludes ambiguous
 # tags (<div>/<p>/<span>/<a>/<img>/<h1>..<h6>/<table>) that legitimately open
