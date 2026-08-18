@@ -10452,7 +10452,7 @@ def _fetch_url_raw(
     Returns (error, body_text, content_type) where *error* is a user‑facing
     message (e.g. “Blocked: …”) or None on success.
     """
-
+    from urllib.parse import urlparse, urljoin, urlunparse
     # --------------------------------------------------------------
     # 1️⃣ Normalise scheme & run policy gate
     # --------------------------------------------------------------
@@ -10472,8 +10472,6 @@ def _fetch_url_raw(
     )
     if not ok:
         return reason, "", ""
-
-    from urllib.parse import urlparse, urljoin, urlunparse
 
     # --------------------------------------------------------------
     # 3️⃣ Prepare a curl session
